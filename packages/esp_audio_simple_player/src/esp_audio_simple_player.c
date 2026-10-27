@@ -418,7 +418,9 @@ esp_gmf_err_t esp_audio_simple_player_destroy(esp_asp_handle_t handle)
     }
     esp_asp_decoder_ref_count--;
     esp_gmf_task_deinit(player->work_task);
-    esp_gmf_pipeline_destroy(player->pipe);
+    if (player->pipe) {
+        esp_gmf_pipeline_destroy(player->pipe);
+    }
     esp_gmf_pool_deinit(player->pool);
     if (player->wait_event) {
         vEventGroupDelete(player->wait_event);

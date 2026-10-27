@@ -5,6 +5,7 @@
  * See LICENSE file for details.
  */
 
+#include <stdio.h>
 #include <string.h>
 #include "esp_log.h"
 #include "esp_gmf_oal_mem.h"
@@ -54,6 +55,29 @@ typedef struct {
 } esp_gmf_audio_dec_t;
 
 static const char *TAG = "ESP_GMF_ASMP_DEC";
+
+static void audio_dec_preview_bytes(const uint8_t *buf, size_t len, char *out, size_t out_size)
+{
+    if (out_size == 0) {
+        return;
+    }
+    if (buf == NULL || len == 0) {
+        snprintf(out, out_size, "empty");
+        return;
+    }
+    size_t preview_len = len < 8 ? len : 8;
+    size_t written = 0;
+    for (size_t i = 0; i < preview_len && written + 4 < out_size; i++) {
+        int ret = snprintf(out + written, out_size - written, i == 0 ? "%02x" : " %02x", buf[i]);
+        if (ret < 0) {
+            break;
+        }
+        written += (size_t)ret;
+    }
+    if (len > preview_len && written + 5 < out_size) {
+        snprintf(out + written, out_size - written, " ...");
+    }
+}
 
 static inline bool audio_check_with_parser(const uint8_t *buf, uint32_t buf_len, esp_es_parse_type_t type)
 {
@@ -364,7 +388,14 @@ static esp_gmf_job_err_t esp_gmf_audio_dec_open(esp_gmf_element_handle_t self, v
         audio_dec->is_opened = true;
     }
     esp_gmf_port_enable_payload_share(ESP_GMF_ELEMENT_GET(self)->in, false);
-    audio_dec->buf_size = DEFAULT_DEC_OUTPUT_BUFFER_SIZE;
+    audio_dec->buf_size = ESP_GMF_ELEMENT_GET(self)->out_attr.data_size;
+    if (audio_dec->buf_size < DEFAULT_DEC_OUTPUT_BUFFER_SIZE) {
+        audio_dec->buf_size = DEFAULT_DEC_OUTPUT_BUFFER_SIZE;
+    }
+    ESP_LOGI(TAG, "Open decoder output buffer: out_attr=%d buf_size=%ld type=%s",
+             ESP_GMF_ELEMENT_GET(self)->out_attr.data_size,
+             (long)audio_dec->buf_size,
+             esp_audio_simple_dec_get_name(dec_cfg->dec_type));
     audio_dec->need_reopen = false;
 __aud_dec_open_exit:
     esp_gmf_oal_mutex_unlock(((esp_gmf_audio_element_t *)self)->lock);
@@ -438,6 +469,7 @@ static esp_gmf_job_err_t esp_gmf_audio_dec_process(esp_gmf_element_handle_t self
     out_load->valid_size = 0;
     audio_dec->out_data.buffer = out_load->buf;
     audio_dec->out_data.len = out_load->buf_length;
+    esp_audio_simple_dec_cfg_t *dec_cfg = (esp_audio_simple_dec_cfg_t *)OBJ_GET_CFG(self);
     if (audio_dec->in_data.len == 0) {
         if (audio_dec->in_load->is_done == true) {
             out_len = ESP_GMF_JOB_ERR_DONE;
@@ -462,7 +494,19 @@ static esp_gmf_job_err_t esp_gmf_audio_dec_process(esp_gmf_element_handle_t self
     while (1) {
         ret = esp_audio_simple_dec_process(audio_dec->dec_hd, &audio_dec->in_data, &audio_dec->out_data);
         if (ret != ESP_AUDIO_ERR_OK && ret != ESP_AUDIO_ERR_BUFF_NOT_ENOUGH) {
-            ESP_LOGE(TAG, "Failed to decode data, ret: %d", ret);
+            char preview[3 * 8 + 5] = {0};
+            audio_dec_preview_bytes(audio_dec->in_data.buffer, audio_dec->in_data.len, preview, sizeof(preview));
+            ESP_LOGE(TAG,
+                     "Failed to decode data: codec=%s ret=%d in_len=%ld consumed=%ld decoded=%ld needed=%ld eos=%d plc=%d preview=%s",
+                     dec_cfg ? esp_audio_simple_dec_get_name(dec_cfg->dec_type) : "unknown",
+                     ret,
+                     audio_dec->in_data.len,
+                     audio_dec->in_data.consumed,
+                     audio_dec->out_data.decoded_size,
+                     audio_dec->out_data.needed_size,
+                     audio_dec->in_data.eos,
+                     audio_dec->in_data.frame_recover,
+                     preview);
             out_len = ESP_GMF_JOB_ERR_FAIL;
             goto __aud_proc_release;
         }

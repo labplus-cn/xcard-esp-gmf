@@ -34,6 +34,8 @@ def _get_c_type_from_value(value: Any) -> str:
     elif isinstance(value, float):
         return 'float'
     elif isinstance(value, str):
+        if value.isupper() and '_' in value:
+            return 'int'
         return 'const char *'
     else:
         return 'void *'

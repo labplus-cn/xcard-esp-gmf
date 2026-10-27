@@ -6,17 +6,24 @@
  */
 
 #include <stdbool.h>
+#include <inttypes.h>
 #include <errno.h>
+#include <stdio.h>
 #include "esp_idf_version.h"
+#include "esp_err.h"
 #include "esp_log.h"
 #include "esp_http_client.h"
+#include "lwip/sockets.h"
 #include "gzip_miniz.h"
 
 #include "esp_gmf_new_databus.h"
 #include "esp_gmf_io_http.h"
 #include "esp_gmf_oal_mem.h"
+#include "esp_gmf_oal_sys.h"
 
 #define HTTP_MAX_CONNECT_TIMES  (5)
+#define HTTP_DIAG_ENDPOINT_LEN  (64)
+#define HTTP_DIAG_PROGRESS_INTERVAL_BYTES  (64 * 1024)
 
 /**
  * @brief  Http io context in GMF
@@ -29,11 +36,160 @@ typedef struct http_io {
     int                       connect_times;  /*!< Max reconnect times */
     bool                      gzip_encoding;  /*!< Content is encoded */
     gzip_miniz_handle_t       gzip;           /*!< GZIP instance */
+    uint64_t                  read_bytes;     /*!< Bytes delivered by this stream */
+    uint64_t                  read_start_offset; /*!< Stream offset at first read */
+    uint64_t                  next_read_log_bytes; /*!< Next periodic INFO log threshold */
+    uint32_t                  read_count;     /*!< Number of successful HTTP reads */
 } http_stream_t;
 
 static const char *TAG = "ESP_GMF_HTTP";
 
 static esp_gmf_err_t _http_destroy(esp_gmf_io_handle_t self);
+
+static void http_diag_format_endpoint(const struct sockaddr_storage *addr,
+                                      char *out, size_t out_len)
+{
+    if (out == NULL || out_len == 0) {
+        return;
+    }
+    if (addr == NULL) {
+        snprintf(out, out_len, "unavailable");
+        return;
+    }
+    if (addr->ss_family == AF_INET) {
+        const struct sockaddr_in *addr4 = (const struct sockaddr_in *)addr;
+        char ip[16] = {0};
+        if (inet_ntop(AF_INET, &addr4->sin_addr, ip, sizeof(ip)) != NULL) {
+            snprintf(out, out_len, "%s:%u", ip, (unsigned)ntohs(addr4->sin_port));
+        } else {
+            snprintf(out, out_len, "ipv4_format_errno=%d", errno);
+        }
+        return;
+    }
+    snprintf(out, out_len, "af=%d", (int)addr->ss_family);
+}
+
+static void http_diag_get_socket_tuple(http_stream_t *http, int *fd_out,
+                                       char *local, size_t local_len,
+                                       char *peer, size_t peer_len)
+{
+    if (fd_out != NULL) {
+        *fd_out = -1;
+    }
+    if (local != NULL && local_len > 0) {
+        snprintf(local, local_len, "unavailable");
+    }
+    if (peer != NULL && peer_len > 0) {
+        snprintf(peer, peer_len, "unavailable");
+    }
+    if (http == NULL || http->client == NULL) {
+        return;
+    }
+
+    int fd = esp_http_client_get_socket(http->client);
+    if (fd_out != NULL) {
+        *fd_out = fd;
+    }
+    if (fd < 0) {
+        return;
+    }
+
+    struct sockaddr_storage local_addr = {0};
+    socklen_t local_addr_len = sizeof(local_addr);
+    if (getsockname(fd, (struct sockaddr *)&local_addr, &local_addr_len) == 0) {
+        http_diag_format_endpoint(&local_addr, local, local_len);
+    } else if (local != NULL && local_len > 0) {
+        snprintf(local, local_len, "getsockname_errno=%d", errno);
+    }
+
+    struct sockaddr_storage peer_addr = {0};
+    socklen_t peer_addr_len = sizeof(peer_addr);
+    if (getpeername(fd, (struct sockaddr *)&peer_addr, &peer_addr_len) == 0) {
+        http_diag_format_endpoint(&peer_addr, peer, peer_len);
+    } else if (peer != NULL && peer_len > 0) {
+        snprintf(peer, peer_len, "getpeername_errno=%d", errno);
+    }
+}
+
+static void http_diag_log_connection(http_stream_t *http, const char *phase,
+                                     int status_code, int64_t content_length,
+                                     uint64_t range_offset)
+{
+    char local[HTTP_DIAG_ENDPOINT_LEN] = {0};
+    char peer[HTTP_DIAG_ENDPOINT_LEN] = {0};
+    int fd = -1;
+    http_diag_get_socket_tuple(http, &fd, local, sizeof(local), peer, sizeof(peer));
+    ESP_LOGI(TAG,
+             "HTTP_DIAG_OPEN phase=%s proto=tcp fd=%d local=%s peer=%s status=%d content_length=%" PRId64
+             " range_offset=%" PRIu64,
+             phase ? phase : "unknown", fd, local, peer, status_code, content_length, range_offset);
+}
+
+static void http_diag_log_error(http_stream_t *http, const char *phase,
+                                int requested_len, int result, int64_t elapsed_ms)
+{
+    char local[HTTP_DIAG_ENDPOINT_LEN] = {0};
+    char peer[HTTP_DIAG_ENDPOINT_LEN] = {0};
+    int fd = -1;
+    int status_code = -1;
+    int tls_error = 0;
+    int tls_flags = 0;
+    esp_err_t tls_ret = ESP_FAIL;
+    esp_gmf_info_file_t info = {0};
+
+    if (http != NULL) {
+        esp_gmf_io_get_info((esp_gmf_io_handle_t)http, &info);
+        if (http->client != NULL) {
+            status_code = esp_http_client_get_status_code(http->client);
+            tls_ret = esp_http_client_get_and_clear_last_tls_error(http->client, &tls_error, &tls_flags);
+        }
+    }
+    http_diag_get_socket_tuple(http, &fd, local, sizeof(local), peer, sizeof(peer));
+    ESP_LOGE(TAG,
+             "HTTP_DIAG_ERR phase=%s req=%d ret=%d elapsed_ms=%" PRId64
+             " errno=%d(%s) tls_ret=%s tls_err=0x%x tls_flags=0x%x status=%d fd=%d local=%s peer=%s"
+             " offset=%" PRIu64 " read_bytes=%" PRIu64 " read_count=%" PRIu32,
+             phase ? phase : "unknown", requested_len, result, elapsed_ms,
+             http ? http->_errno : 0, strerror(http ? http->_errno : 0), esp_err_to_name(tls_ret),
+             tls_error, tls_flags, status_code, fd, local, peer, info.pos,
+             http ? http->read_bytes : 0, http ? http->read_count : 0);
+}
+
+static void http_diag_log_read(http_stream_t *http, int requested_len,
+                               int result, int64_t elapsed_ms)
+{
+    if (http == NULL) {
+        return;
+    }
+
+    if (result > 0) {
+        http->read_bytes += (uint64_t)result;
+        http->read_count++;
+        uint64_t offset = http->read_start_offset + http->read_bytes;
+        ESP_LOGD(TAG,
+                 "HTTP_DIAG_READ req=%d ret=%d elapsed_ms=%" PRId64
+                 " offset=%" PRIu64 " read_bytes=%" PRIu64 " read_count=%" PRIu32,
+                 requested_len, result, elapsed_ms, offset, http->read_bytes, http->read_count);
+        if (http->next_read_log_bytes == 0) {
+            http->next_read_log_bytes = HTTP_DIAG_PROGRESS_INTERVAL_BYTES;
+        }
+        if (http->read_bytes >= http->next_read_log_bytes) {
+            ESP_LOGI(TAG,
+                     "HTTP_DIAG_READ progress req=%d ret=%d elapsed_ms=%" PRId64
+                     " offset=%" PRIu64 " read_bytes=%" PRIu64 " read_count=%" PRIu32,
+                     requested_len, result, elapsed_ms, offset, http->read_bytes, http->read_count);
+            while (http->read_bytes >= http->next_read_log_bytes) {
+                http->next_read_log_bytes += HTTP_DIAG_PROGRESS_INTERVAL_BYTES;
+            }
+        }
+    } else if (result == 0) {
+        ESP_LOGI(TAG,
+                 "HTTP_DIAG_READ eof req=%d elapsed_ms=%" PRId64
+                 " offset=%" PRIu64 " read_bytes=%" PRIu64 " read_count=%" PRIu32,
+                 requested_len, elapsed_ms, http->read_start_offset + http->read_bytes,
+                 http->read_bytes, http->read_count);
+    }
+}
 
 static int _gzip_read_data(uint8_t *data, int size, void *ctx)
 {
@@ -159,6 +315,9 @@ static esp_gmf_err_t _http_open(esp_gmf_io_handle_t self)
         err = esp_http_client_open(http->client, -1);
         if (err == ESP_GMF_ERR_OK) {
             http->is_open = true;
+        } else {
+            http->_errno = esp_http_client_get_errno(http->client);
+            http_diag_log_error(http, "open_writer", -1, err, 0);
         }
         return err;
     }
@@ -172,6 +331,8 @@ _stream_redirect:
         http->gzip_encoding = false;
     }
     if ((err = esp_http_client_open(http->client, post_len)) != ESP_GMF_ERR_OK) {
+        http->_errno = esp_http_client_get_errno(http->client);
+        http_diag_log_error(http, "open", post_len, err, 0);
         ESP_LOGE(TAG, "Failed to open http stream");
         return err;
     }
@@ -201,6 +362,10 @@ _stream_redirect:
     if (info.pos <= 0) {
         info.size = cur_pos;
     }
+    if (http->read_count == 0 && http->read_bytes == 0) {
+        http->read_start_offset = info.pos;
+        http->next_read_log_bytes = HTTP_DIAG_PROGRESS_INTERVAL_BYTES;
+    }
 
     ESP_LOGI(TAG, "The total size is %d bytes", (int)info.size);
     int status_code = esp_http_client_get_status_code(http->client);
@@ -209,10 +374,13 @@ _stream_redirect:
         goto _stream_redirect;
     }
     if (status_code != 200 && (esp_http_client_get_status_code(http->client) != 206)) {
+        http_diag_log_error(http, "status", 0, status_code, 0);
         ESP_LOGE(TAG, "Invalid HTTP stream, status code = %d", status_code);
         return ESP_GMF_ERR_FAIL;
     }
     esp_gmf_io_set_size(self, info.size);
+    http_diag_log_connection(http, "open", status_code,
+                             esp_http_client_get_content_length(http->client), info.pos);
     http->is_open = true;
 
     return ESP_GMF_ERR_OK;
@@ -255,6 +423,11 @@ static esp_gmf_err_t _http_close(esp_gmf_io_handle_t self)
         http->gzip = NULL;
     }
     if (http->client) {
+        ESP_LOGI(TAG,
+                 "HTTP_DIAG_CLOSE read_bytes=%" PRIu64 " read_count=%" PRIu32
+                 " reconnects=%d errno=%d(%s)",
+                 http->read_bytes, http->read_count, http->connect_times,
+                 http->_errno, strerror(http->_errno));
         esp_http_client_close(http->client);
         esp_http_client_cleanup(http->client);
         http->client = NULL;
@@ -266,8 +439,16 @@ static esp_gmf_err_t _http_reconnect(esp_gmf_io_handle_t self)
 {
     esp_gmf_err_t err = ESP_GMF_ERR_OK;
     ESP_GMF_NULL_CHECK(TAG, self, return ESP_GMF_ERR_FAIL);
+    http_stream_t *http = (http_stream_t *)self;
+    ESP_LOGW(TAG,
+             "HTTP_DIAG_RECONNECT phase=begin attempt=%d/%d read_bytes=%" PRIu64
+             " read_count=%" PRIu32,
+             http->connect_times, HTTP_MAX_CONNECT_TIMES + 1,
+             http->read_bytes, http->read_count);
     err |= _http_close(self);
     err |= _http_open(self);
+    ESP_LOGW(TAG, "HTTP_DIAG_RECONNECT phase=end attempt=%d/%d result=%d",
+             http->connect_times, HTTP_MAX_CONNECT_TIMES + 1, err);
     return err;
 }
 
@@ -276,17 +457,26 @@ static int _http_read(esp_gmf_io_handle_t self, char *buffer, int len, TickType_
     http_stream_t *http = (http_stream_t *)self;
     int wrlen = dispatch_hook(self, HTTP_STREAM_ON_RESPONSE, buffer, len);
     int rlen = wrlen;
+    int64_t start_time_ms = esp_gmf_oal_sys_get_time_ms();
     if (rlen == 0) {
         rlen = _http_read_data(http, buffer, len);
     }
+    int64_t elapsed_ms = esp_gmf_oal_sys_get_time_ms() - start_time_ms;
     if (rlen <= 0) {
         http->_errno = esp_http_client_get_errno(http->client);
         ESP_LOGW(TAG, "No more data, errno: %d, rlen = %d", http->_errno, rlen);
         if (http->_errno != 0) {  // Error occuered, reset connection
             ESP_LOGE(TAG, "Got %d errno(%s)", http->_errno, strerror(http->_errno));
         }
+        if (rlen < 0) {
+            http_diag_log_error(http, "read", len, rlen, elapsed_ms);
+        } else {
+            http_diag_log_read(http, len, rlen, elapsed_ms);
+        }
+    } else {
+        http_diag_log_read(http, len, rlen, elapsed_ms);
     }
-    ESP_LOGD(TAG, "req length = %d, read = %d", len, rlen);
+    ESP_LOGD(TAG, "req length = %d, read = %d elapsed_ms=%" PRId64, len, rlen, elapsed_ms);
     return rlen;
 }
 
